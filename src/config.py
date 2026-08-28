@@ -55,12 +55,20 @@ ANTHROPIC_API_KEY = _optional("ANTHROPIC_API_KEY")
 class RunConfig:
     """Replay pathology and watermark settings for one run.
 
-    Bounds are enforced here so a bad value fails at construction
-    rather than producing a run whose results look plausible but
-    are meaningless.
+    TWO CLOCKS, TWO UNITS. Mixing them is the classic bug:
+
+    Feed pathology is in ARRIVAL seconds — wall-clock delay between an
+    event happening and the consumer seeing it. Sub-second to a few
+    seconds.
+
+    Watermark settings are in EVENT seconds — session time. A window
+    keyed (driver, lap) spans the whole lap in event time (~66s from
+    sector 1 completing to sector 3 completing), and concurrent drivers
+    are spread across another ~35s. allowed_lateness must exceed that
+    combined span, or windows close before their own sectors arrive.
     """
 
-    # Feed pathology
+    # --- Feed pathology: ARRIVAL seconds ---
     base_delay_s: float = 0.05
     tail_delay_s: float = 2.0
     p_tail: float = 0.05
@@ -68,11 +76,13 @@ class RunConfig:
     p_drop: float = 0.0
     reorder_jitter_s: float = 0.5
 
-    # Watermark
-    allowed_lateness_s: float = 3.0
-    max_lateness_s: float = 30.0
+    # --- Watermark: EVENT seconds (session time) ---
+    # 150s covers intra-lap span (~66s) plus inter-driver skew (~35s)
+    # with margin. Below ~110s, windows start closing early.
+    allowed_lateness_s: float = 150.0
+    max_lateness_s: float = 600.0
 
-    # Replay speed multiplier: 10.0 means 10x faster than real time
+    # Replay speed multiplier: 20.0 means 20x faster than real time
     speed: float = 20.0
 
     # Checkpoint every N processed events
@@ -93,8 +103,8 @@ class RunConfig:
         check("p_duplicate", 0.0, 0.5)
         check("p_drop", 0.0, 0.5)
         check("reorder_jitter_s", 0.0, 60.0)
-        check("allowed_lateness_s", 0.0, 300.0)
-        check("max_lateness_s", 0.0, 3600.0)
+        check("allowed_lateness_s", 0.0, 3600.0)
+        check("max_lateness_s", 0.0, 7200.0)
         check("speed", 0.1, 1000.0)
         check("checkpoint_every", 1, 100_000)
 
