@@ -1,29 +1,32 @@
 """The real processor: event-time windows closed by watermark advance,
-with late data amended or side-output rather than silently discarded.
+with late data amended or side-output, and state checkpointed so a
+killed process resumes without loss or double-counting.
 
-Late-data policy, in order:
-  window still open              -> accumulate normally
-  closed and still retained      -> amend, bump version, log 'amended'
-  closed and evicted (tombstone) -> drop, log 'dropped_beyond_max_lateness'
-
-The tombstone check must come before routing. Without it, a late event
-for an evicted window creates a fresh one-sector window that overwrites
-the correct published result.
+Recovery is approximate on purpose. raw_events carries a unique
+constraint, so replaying events across the checkpoint boundary is a
+no-op. At-least-once delivery plus idempotent writes is what real
+systems ship, rather than chasing exactly-once.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 
 import asyncpg
 
+from src.checkpoint import load_latest, save
 from src.config import RunConfig
 from src.events import Event
 from src.watermark import Watermark
 from src.windows import WindowState, WindowStore
 
 BATCH_SIZE = 500
+
+
+class CrashSimulated(RuntimeError):
+    """Raised to abort a run at a chosen point, mimicking kill -9."""
 
 
 async def create_run(
@@ -151,23 +154,54 @@ async def write_late_events(
 
 
 async def run_processor(
-    pool: asyncpg.Pool, dataset_id: str, config: RunConfig, seed: int = 7
+    pool: asyncpg.Pool,
+    dataset_id: str,
+    config: RunConfig,
+    seed: int = 7,
+    crash_after: int | None = None,
+    resume_run_id: str | None = None,
 ) -> tuple[str, dict]:
     """Consume the feed with event-time semantics. Returns (run_id, stats)."""
     from src.feed import replay
 
-    run_id = await create_run(pool, dataset_id, config)
+    start_from_seq = 0
+    if resume_run_id is not None:
+        run_id = resume_run_id
+        restored = await load_latest(pool, run_id, config)
+        if restored is None:
+            print("   no checkpoint found; restarting this run from the top")
+            watermark = Watermark(
+                allowed_lateness=config.allowed_lateness_s,
+                max_lateness=config.max_lateness_s,
+            )
+            store = WindowStore()
+        else:
+            watermark, store, start_from_seq = restored
+            print(
+                f"   restored: watermark {watermark.value:.1f}s, "
+                f"{len(store.open):,} open, {len(store.closed):,} closed, "
+                f"{len(store.tombstones):,} tombstones, "
+                f"resuming at delivery {start_from_seq:,}"
+            )
+    else:
+        run_id = await create_run(pool, dataset_id, config)
+        watermark = Watermark(
+            allowed_lateness=config.allowed_lateness_s,
+            max_lateness=config.max_lateness_s,
+        )
+        store = WindowStore()
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-
     feeder = asyncio.create_task(
-        replay(dataset_id, config, queue, seed=seed, real_time=False)
+        replay(
+            dataset_id,
+            config,
+            queue,
+            seed=seed,
+            start_from_seq=start_from_seq,
+            real_time=False,
+        )
     )
-
-    watermark = Watermark(
-        allowed_lateness=config.allowed_lateness_s,
-        max_lateness=config.max_lateness_s,
-    )
-    store = WindowStore()
 
     processed = 0
     duplicates = 0
@@ -175,7 +209,9 @@ async def run_processor(
     dropped_late = 0
     closed_total = 0
     max_lateness_seen = 0.0
-    batch: list[Event] = []
+    last_seq = start_from_seq
+    since_checkpoint = 0
+    batch: list[tuple[int, Event]] = []
     exhausted = False
 
     async with pool.acquire() as conn:
@@ -184,17 +220,20 @@ async def run_processor(
             if item is None:
                 exhausted = True
             else:
-                batch.append(item[1])
+                batch.append(item)
 
             if not batch or (len(batch) < BATCH_SIZE and not exhausted):
                 continue
 
-            new_keys = await insert_events(conn, run_id, batch)
+            events = [event for _, event in batch]
+            last_seq = batch[-1][0]
+
+            new_keys = await insert_events(conn, run_id, events)
             seen_in_batch: set[str] = set()
             to_write: list[WindowState] = []
             late_records: list[dict] = []
 
-            for event in batch:
+            for event in events:
                 if event.event_key not in new_keys or event.event_key in seen_in_batch:
                     duplicates += 1
                     continue
@@ -206,13 +245,10 @@ async def run_processor(
                 if lateness > max_lateness_seen:
                     max_lateness_seen = lateness
 
-                # Tombstone check FIRST. This window was already published;
-                # routing it again would resurrect a one-sector fragment.
                 if store.is_tombstoned(event.driver, event.lap):
                     closed = store.find_closed(event.driver, event.lap)
 
-                    if closed is None:
-                        # State evicted past the horizon. Too late to fix.
+                    if closed is None or watermark.is_droppable(event.event_time):
                         dropped_late += 1
                         late_records.append(
                             {
@@ -226,21 +262,6 @@ async def run_processor(
                         )
                         continue
 
-                    if watermark.is_droppable(event.event_time):
-                        dropped_late += 1
-                        late_records.append(
-                            {
-                                "event_key": event.event_key,
-                                "driver": event.driver,
-                                "lap": event.lap,
-                                "event_time": event.event_time,
-                                "lateness": lateness,
-                                "disposition": "dropped_beyond_max_lateness",
-                            }
-                        )
-                        continue
-
-                    # Within the horizon: amend the published result.
                     if closed.add(event):
                         closed.version += 1
                         amended += 1
@@ -270,12 +291,31 @@ async def run_processor(
             await write_windows(conn, run_id, to_write)
             await write_late_events(conn, run_id, late_records)
 
+            # Checkpoint AFTER the writes it describes are durable.
+            # The other order would claim progress not yet persisted.
+            since_checkpoint += len(events)
+            if since_checkpoint >= config.checkpoint_every:
+                await save(conn, run_id, watermark, store, last_seq)
+                since_checkpoint = 0
+
             batch.clear()
             print(
                 f"   ...{processed:,} events, watermark {watermark.value:8.1f}s, "
                 f"{closed_total:,} closed, {amended:,} amended",
                 end="\r",
             )
+
+            if crash_after is not None and processed >= crash_after:
+                await save(conn, run_id, watermark, store, last_seq)
+                print(" " * 80, end="\r")
+                print(
+                    f"SIMULATED CRASH after {processed:,} events "
+                    f"(delivery {last_seq:,}). State checkpointed."
+                )
+                print(f"   run_id: {run_id}")
+                print("   resume with: python run_stream.py --resume")
+                feeder.cancel()
+                os._exit(137)  # mimics SIGKILL: no cleanup, no finally
 
         watermark.advance_to_end()
         remaining = store.drain()
