@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>F1-Stream</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="wordmark">
+      <span class="wordmark-f1">F1</span><span class="wordmark-rest">stream</span>
+    </div>
+    <p class="tagline">Event-time windowing over an unreliable feed</p>
+    <div class="conn" id="conn">
+      <span class="dot" id="conn-dot"></span>
+      <span id="conn-text">Checking</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="panel-auth">
+      <h2>Sign in</h2>
+      <p class="hint">Your key is exchanged once for a session cookie the page itself cannot read.</p>
+      <div class="row">
+        <input type="password" id="api-key" placeholder="API key" autocomplete="off">
+        <button id="btn-signin" class="primary">Sign in</button>
+      </div>
+      <p class="msg" id="auth-msg"></p>
+    </section>
+
+    <section class="panel hidden" id="panel-control">
+      <h2>Start a run</h2>
+
+      <label class="field">
+        <span>Dataset</span>
+        <select id="dataset"></select>
+      </label>
+
+      <div class="dials">
+        <label class="dial">
+          <span>Allowed lateness <output id="out-lateness">150</output>s</span>
+          <input type="range" id="lateness" min="0" max="400" step="5" value="150">
+          <em>How far behind the newest event the watermark sits. Lower it and windows close before their sectors arrive.</em>
+        </label>
+
+        <label class="dial">
+          <span>Correction horizon <output id="out-max">600</output>s</span>
+          <input type="range" id="max-lateness" min="0" max="900" step="10" value="600">
+          <em>How long a closed window stays amendable. Past this, late events are dropped and logged.</em>
+        </label>
+
+        <label class="dial">
+          <span>Duplicate rate <output id="out-dup">2</output>%</span>
+          <input type="range" id="dup" min="0" max="20" step="1" value="2">
+          <em>Deliveries sent twice. The database absorbs these on a unique key.</em>
+        </label>
+
+        <label class="dial">
+          <span>Delay tail <output id="out-tail">2.0</output>s</span>
+          <input type="range" id="tail" min="0" max="30" step="0.5" value="2">
+          <em>Worst-case arrival delay for the slow 5% of deliveries.</em>
+        </label>
+      </div>
+
+      <div class="row">
+        <button id="btn-run" class="primary">Start run</button>
+        <button id="btn-reconcile" disabled>Check against ground truth</button>
+      </div>
+      <p class="msg" id="run-msg"></p>
+    </section>
+
+    <section class="panel hidden" id="panel-live">
+      <div class="watermark-strip">
+        <div class="watermark-label">
+          <span>Watermark</span>
+          <strong id="wm-value">—</strong>
+        </div>
+        <div class="watermark-track"><div class="watermark-fill" id="wm-fill"></div></div>
+      </div>
+
+      <dl class="counters">
+        <div><dt>Events</dt><dd id="c-events">0</dd></div>
+        <div><dt>Closed</dt><dd id="c-closed" class="v-closed">0</dd></div>
+        <div><dt>Amended</dt><dd id="c-amended" class="v-amended">0</dd></div>
+        <div><dt>Dropped</dt><dd id="c-dropped" class="v-dropped">0</dd></div>
+      </dl>
+
+      <div class="board-head">
+        <h2>Windows</h2>
+        <ul class="legend">
+          <li><i class="sw-closed"></i>closed</li>
+          <li><i class="sw-amended"></i>amended</li>
+          <li><i class="sw-incomplete"></i>incomplete</li>
+        </ul>
+      </div>
+      <div class="board" id="board">
+        <p class="empty">No windows yet. Start a run to watch them close.</p>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="panel-result">
+      <h2>Reconciliation</h2>
+      <div class="verdict" id="verdict"></div>
+      <table class="mismatches hidden" id="mismatch-table">
+        <thead>
+          <tr><th>Driver</th><th>Lap</th><th>Expected</th><th>Actual</th><th>Sectors</th></tr>
+        </thead>
+        <tbody id="mismatch-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
